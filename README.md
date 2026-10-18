@@ -14,6 +14,7 @@ Specs and development tickets are tracked as local Markdown under `.scratch/` an
 - Detect menu bar icons and configure visibility and ordering by dragging.
 - Keep configured relative order across application restarts.
 - Synchronize visibility and ordering across desktops (Spaces) and external displays.
+- Work when the system menu bar is revealed in fullscreen or auto-hide mode.
 - Provide launch at login, necessary permission controls, and About inside Settings.
 - Keep the arrow's context menu limited to Settings and Quit.
 - Version 1.0; manual downloads only, with no automatic update checks.
