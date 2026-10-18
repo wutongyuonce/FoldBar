@@ -25,4 +25,4 @@ FoldBar will deliberately persist only one `config.json` for icon ordering and v
 
 ## License and attribution
 
-GPL-3.0. The implementation will reuse or adapt essential platform mechanisms from [Ice](https://github.com/jordanbaird/Ice), with source attribution and modification notices retained. No Ice application code has been incorporated at this stage.
+GPL-3.0. FoldBar is independently implemented. [Ice](https://github.com/jordanbaird/Ice) is a behavior and UI reference only; its code is not copied or treated as the authority for current macOS APIs.

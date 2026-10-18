@@ -47,7 +47,7 @@ Status: ready-for-agent
 
 ### Product and distribution
 
-- Name: FoldBar; public repository: wutongyuonce/FoldBar; license: GPL-3.0. Retain Ice source attribution and modification notices for adapted code.
+- Name: FoldBar; public repository: wutongyuonce/FoldBar; license: GPL-3.0. Independently implement the app using current Apple documentation, the macOS 27 SDK, and runtime evidence. Ice code and UI are reference material only; do not copy its implementation or treat its private API choices as authoritative.
 - Native AppKit and SwiftUI application with a menu-bar-only lifecycle. About lives inside Settings; the arrow's context menu contains only Settings and Quit.
 - Initial distribution targets Apple Silicon, prioritizing macOS 27 and newer releases. Minimum deployment target remains macOS 14, but compatibility is claimed only for tested versions. Future OS versions are not guaranteed merely because they are newer.
 - Use the available Swift toolchain to build, assemble an app bundle, ad-hoc sign it, and produce a DMG. Initial delivery is unnotarized because no Developer ID certificate is available.
@@ -57,7 +57,7 @@ Status: ready-for-agent
 ### Authorities and invariants
 
 - The layout domain owns registered identities, membership, order, discovery rules, and configuration validation. Settings and the drawer present its results instead of independently deciding order.
-- The platform adapter owns window discovery, identity evidence, display/Space association, system restrictions, screenshots, movement, input forwarding, and restoration. Private system calls remain inside this boundary.
+- The platform adapter owns window discovery, identity evidence, display/Space association, system restrictions, screenshots, movement, input forwarding, and restoration. Prefer documented APIs; any necessary undocumented behavior is isolated and explicitly documented with observed limits inside this boundary.
 - A single serial coordinator applies the authoritative layout to the live environment. Discovery and screen changes request reconciliation; they do not replace saved order with observed order.
 - New identifiable icons append to the visible group. Initial simultaneous discovery is ordered left to right. Registered icons retain their relative order regardless of absence, restart, window identifiers, or display changes.
 - Persistent layout edits originate from Settings drag operations. Transient changes in the system menu bar do not become new persisted order automatically.
@@ -69,7 +69,7 @@ Status: ready-for-agent
 
 - Settings presents visible and hidden groups in left-to-right order, with drag-to-reorder and drag-between-groups. Offline records retain position and appear inactive.
 - The drawer displays captured representations of hidden icons. Clicking transfers the original input semantics to the corresponding real icon; it does not merely launch the owning application.
-- The platform may temporarily expose a real icon in the menu bar to interact with it. Restore the configured layout after its menu/panel is dismissed. Restoration must also run after failure or cancellation; disappearance of the owning application must not block recovery of the remaining layout.
+- The independently implemented platform adapter may temporarily expose a real icon in the menu bar to interact with it, if current-system testing shows this is necessary. Restore the configured layout after its menu/panel is dismissed. Restoration must also run after failure or cancellation; disappearance of the owning application must not block recovery of the remaining layout.
 - Do not move icons underneath an ongoing user drag or while a native icon interface is being used. Reconcile after that interaction ends.
 - All Spaces and displays share one configuration. Space switches, display connection/disconnection, application lifecycle changes, wake, and permission changes invalidate transient geometry and trigger fresh discovery.
 - Anchor the drawer to the screen on which the user activates the arrow, including when that screen has negative desktop coordinates or a different scale. Keep the drawer within usable screen bounds and allow overflow to be accessed without adding a second product feature.
