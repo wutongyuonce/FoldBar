@@ -62,6 +62,7 @@ Status: ready-for-agent
 - New identifiable icons append to the visible group. Initial simultaneous discovery is ordered left to right. Registered icons retain their relative order regardless of absence, restart, window identifiers, or display changes.
 - Persistent layout edits originate from Settings drag operations. Transient changes in the system menu bar do not become new persisted order automatically.
 - One logical icon has one saved record even if macOS exposes multiple display or Space representations. Runtime window IDs, process IDs, display IDs, and coordinates are not persistent identity.
+- Single-icon apps (counted across all running instances) persist an application slot identified by their bundle ID. Icon content changes and process restarts inherit that slot. Distinct AXIdentifiers can identify multiple items from an app. This application-slot interpretation was explicitly confirmed by the user.
 - Use stable identity evidence where available. If identity cannot be established without guessing between competing icons, present the ambiguity and keep the affected icon accessible; never silently transfer another icon's visibility or position.
 - System-restricted icons remain visible with an explanation of their unavailable operations. Their system-mandated placement is excluded from the user-configured ordering guarantee.
 

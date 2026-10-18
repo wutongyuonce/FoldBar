@@ -12,6 +12,98 @@ struct LiveItem: Identifiable {
     let reason: String?
 }
 
+/// Watches the dispatched icon's native interface; focus alone is never menu state.
+@MainActor final class MenuInteraction: NativeInteractionBoundary {
+    private let platform: MenuBarPlatform
+    private let item: LiveItem
+    private let right: Bool
+    private let exposure: () async throws -> Void
+    private let restoration: (Bool) async throws -> Void
+    private var baseline: Set<CGWindowID> = []
+    private var observedWindows: Set<CGWindowID> = []
+    private var observer: AXObserver?
+    private var registrations: [(AXUIElement, CFString)] = []
+    private var menuDepth = 0
+    private var sampleCount = 0
+    private var pid: pid_t = 0
+
+    init(platform: MenuBarPlatform, item: LiveItem, right: Bool,
+         exposure: @escaping () async throws -> Void,
+         restoration: @escaping (Bool) async throws -> Void) {
+        self.platform = platform
+        self.item = item
+        self.right = right
+        self.exposure = exposure
+        self.restoration = restoration
+        AXUIElementGetPid(item.element, &pid)
+    }
+
+    func expose() async throws {
+        try await exposure()
+        baseline = currentWindows()
+        let callback: AXObserverCallback = { _, _, notification, context in
+            guard let context else { return }
+            MainActor.assumeIsolated {
+                let watch = Unmanaged<MenuInteraction>.fromOpaque(context).takeUnretainedValue()
+                if notification as String == kAXMenuOpenedNotification as String { watch.menuDepth += 1 }
+                if notification as String == kAXMenuClosedNotification as String { watch.menuDepth = max(0, watch.menuDepth - 1) }
+            }
+        }
+        var created: AXObserver?
+        if AXObserverCreate(pid, callback, &created) == .success, let created {
+            observer = created
+            let root = AXUIElementCreateApplication(pid)
+            for notification in [kAXMenuOpenedNotification, kAXMenuClosedNotification] {
+                if AXObserverAddNotification(created, root, notification as CFString, Unmanaged.passUnretained(self).toOpaque()) == .success {
+                    registrations.append((root, notification as CFString))
+                }
+            }
+            CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .commonModes)
+        }
+    }
+
+    func dispatch() async throws { try platform.press(item, right: right) }
+
+    func observe() async throws -> NativeInterfaceState {
+        guard NSRunningApplication(processIdentifier: pid) != nil else { return .disappeared }
+        sampleCount += 1
+        let windows = currentWindows()
+        observedWindows.formUnion(windows.subtracting(baseline))
+        let shownMenu = MenuBarPlatform.attribute(item.element, "AXShownMenuUIElement")
+        let expanded = MenuBarPlatform.attribute(item.element, "AXExpanded") as? Bool ?? false
+        let selected = MenuBarPlatform.attribute(item.element, "AXSelected") as? Bool ?? false
+        if (observer != nil && menuDepth > 0) || shownMenu != nil || expanded || selected || !windows.intersection(observedWindows).isEmpty || NSEvent.pressedMouseButtons != 0 {
+            return .open
+        }
+        // Allow the target a bounded startup interval to present its UI.
+        return sampleCount < 5 ? .pending : .closed
+    }
+
+    func wait() async throws { try await Task.sleep(for: .milliseconds(200)) }
+
+    func restore(canMove: Bool) async throws {
+        if let observer {
+            for (element, notification) in registrations { AXObserverRemoveNotification(observer, element, notification) }
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        }
+        observer = nil
+        registrations = []
+        try await restoration(canMove)
+    }
+
+    private func currentWindows() -> Set<CGWindowID> {
+        let hosts = Set(NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == "com.apple.MenuBarAgent" }.map(\.processIdentifier)).union([pid])
+        let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
+        return Set(windows.compactMap { window in
+            guard let owner = window[kCGWindowOwnerPID as String] as? pid_t, hosts.contains(owner),
+                  let id = window[kCGWindowNumber as String] as? CGWindowID,
+                  let bounds = window[kCGWindowBounds as String] as? NSDictionary,
+                  let frame = CGRect(dictionaryRepresentation: bounds), frame.height > 40 else { return nil }
+            return id
+        })
+    }
+}
+
 enum PlatformError: LocalizedError {
     case unavailable(String)
     var errorDescription: String? {
@@ -39,7 +131,7 @@ enum PlatformError: LocalizedError {
 
     nonisolated static func scan() -> [LiveItem] {
         guard AXIsProcessTrusted() else { return [] }
-        var result: [LiveItem] = []
+        var discovered: [(bundle: String, name: String, element: AXUIElement)] = []
         for app in NSWorkspace.shared.runningApplications where app.processIdentifier != getpid() {
             guard let bundle = app.bundleIdentifier else { continue }
             let root = AXUIElementCreateApplication(app.processIdentifier)
@@ -54,23 +146,27 @@ enum PlatformError: LocalizedError {
                 }
                 return []
             }
-            let identifiers = candidates.map { Self.attribute($0, "AXIdentifier") as? String ?? "" }
-            for (index, element) in candidates.enumerated() {
+            discovered += candidates.map { (bundle, app.localizedName ?? bundle, $0) }
+        }
+        var result: [LiveItem] = []
+        // Evaluate all instances together: two processes must not both inherit
+        // one bundle's slot or the same supposedly distinct item identifier.
+        for (bundle, items) in Dictionary(grouping: discovered, by: \.bundle) {
+            let identifiers = items.map { Self.attribute($0.element, "AXIdentifier") as? String ?? "" }
+            for (index, candidate) in items.enumerated() {
+                let element = candidate.element
                 guard let frame = Self.rect(element), frame.width > 0, frame.height > 0 else { continue }
                 let identifier = identifiers[index]
-                let uniqueIdentifier = !identifier.isEmpty && identifiers.filter { $0 == identifier }.count == 1
-                // A single unnamed item has a stable application slot. Multi-item apps
-                // require an actual distinct identifier; dynamic labels are not identity.
-                let ambiguous = candidates.count > 1 && !uniqueIdentifier
-                let key = uniqueIdentifier ? "\(bundle)/ax:\(identifier)" : "\(bundle)/single"
-                let system = bundle.hasPrefix("com.apple.")
+                let identity = ItemIdentity.discovered(bundleID: bundle, name: candidate.name, identifiers: identifiers, at: index)
+                let ambiguous = identity == nil
+                let protected = ["com.apple.menuextra.audiovideo", "com.apple.menuextra.controlcenter", "com.apple.menuextra.clock"].contains(identifier)
                 result.append(LiveItem(
-                    id: ambiguous ? "ambiguous:\(bundle):\(index)" : key,
-                    name: bundle == "com.apple.MenuBarAgent" ? (Self.attribute(element, "AXDescription") as? String ?? app.localizedName ?? bundle) : (app.localizedName ?? bundle),
+                    id: identity?.id ?? "ambiguous:\(bundle):\(index)",
+                    name: bundle == "com.apple.MenuBarAgent" ? (Self.attribute(element, "AXDescription") as? String ?? candidate.name) : candidate.name,
                     bundleID: bundle,
                     element: element,
                     frame: frame,
-                    reason: ambiguous ? "此应用有多个无法稳定区分的图标" : (system ? "系统图标由 macOS 管理" : nil)
+                    reason: ambiguous ? "此应用有多个无法稳定区分的图标" : (protected ? "系统控制或隐私指示项，保持可见" : nil)
                 ))
             }
         }
@@ -80,7 +176,7 @@ enum PlatformError: LocalizedError {
     func capture(_ item: LiveItem) async throws -> NSImage {
         guard CGPreflightScreenCaptureAccess() else { throw PlatformError.unavailable("需要屏幕录制权限以显示真实图标") }
         let rect = Self.rect(item.element) ?? item.frame
-        guard NSScreen.screens.contains(where: { Self.quartzFrame($0).contains(rect) }) else {
+        guard isPresented(item.element), NSScreen.screens.contains(where: { Self.quartzFrame($0).contains(rect) }) else {
             throw PlatformError.unavailable("图标当前不在可捕获区域，尚未取得图标图像")
         }
         // Current public screenshot API: capture exactly the icon region, no disk output.
@@ -111,6 +207,20 @@ enum PlatformError: LocalizedError {
         return NSImage(cgImage: image, size: rect.size)
     }
 
+    func isPresented(_ element: AXUIElement) -> Bool {
+        guard let frame = Self.rect(element) else { return false }
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(frame.midX), Float(frame.midY), &hit) == .success else { return false }
+        // Hosts may return a child view; accept only a matching element/ancestor.
+        for _ in 0..<5 {
+            guard let current = hit else { return false }
+            if CFEqual(current, element) { return true }
+            guard let parent = Self.attribute(current, "AXParent"), CFGetTypeID(parent) == AXUIElementGetTypeID() else { return false }
+            hit = (parent as! AXUIElement)
+        }
+        return false
+    }
+
     static func quartzFrame(_ screen: NSScreen) -> CGRect {
         let mainHeight = NSScreen.screens.first?.frame.height ?? screen.frame.height
         return CGRect(x: screen.frame.minX, y: mainHeight - screen.frame.maxY, width: screen.frame.width, height: screen.frame.height)
@@ -137,11 +247,19 @@ enum PlatformError: LocalizedError {
         guard AXIsProcessTrusted(), item.reason == nil else {
             throw PlatformError.unavailable(item.reason ?? "需要辅助功能权限")
         }
+        for _ in 0..<40 {
+            try Task.checkCancellation()
+            if NSEvent.pressedMouseButtons == 0, NSEvent.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
         guard NSEvent.pressedMouseButtons == 0, NSEvent.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty else {
             throw PlatformError.unavailable("请松开鼠标和修饰键后再试")
         }
         guard let initial = Self.rect(item.element), let source = CGEventSource(stateID: .hidSystemState) else {
             throw PlatformError.unavailable("图标已退出或无法创建拖动事件")
+        }
+        guard isPresented(item.element) else {
+            throw PlatformError.unavailable("“\(item.name)”当前位于系统溢出区；请先在 macOS 菜单栏展开它，再重试")
         }
         let oldPointer = CGEvent(source: nil)?.location
         var mouseHeld = false

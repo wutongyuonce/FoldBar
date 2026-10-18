@@ -12,6 +12,14 @@ public struct ItemIdentity: Codable, Equatable, Identifiable {
         self.name = name
         self.group = group
     }
+
+    public static func discovered(bundleID: String, name: String, identifiers: [String], at index: Int) -> ItemIdentity? {
+        guard identifiers.indices.contains(index) else { return nil }
+        if identifiers.count == 1 { return ItemIdentity(id: bundleID + "/app", name: name) }
+        let identifier = identifiers[index]
+        guard !identifier.isEmpty, identifiers.filter({ $0 == identifier }).count == 1 else { return nil }
+        return ItemIdentity(id: bundleID + "/ax:" + identifier, name: name)
+    }
 }
 
 public final class LayoutStore {

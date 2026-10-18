@@ -25,7 +25,10 @@ import FoldBarCore
     private var reconciling = false
     private var pending = false
     private var interacting = false
+    private var awaitingManualRecovery = false
+    private var recoveryInteraction: MenuInteraction?
     private var lastSignature = ""
+    private var failedSignature = ""
     private var layoutTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -40,7 +43,23 @@ import FoldBarCore
         } else { arrow.button?.sendAction(on: [.leftMouseUp, .rightMouseUp]) }
         boundary = NSStatusBar.system.statusItem(withLength: 1)
         boundary.button?.setAccessibilityLabel("FoldBar 布局边界")
-        model.applyLayout = { [weak self] in try await self?.reconcile() }
+        let mainMenu = NSMenu()
+        let applicationItem = NSMenuItem()
+        let applicationMenu = NSMenu()
+        applicationMenu.addItem(withTitle: "设置…", action: #selector(showSettings), keyEquivalent: ",").target = self
+        applicationMenu.addItem(withTitle: "退出 FoldBar", action: #selector(quit), keyEquivalent: "q").target = self
+        applicationItem.submenu = applicationMenu
+        mainMenu.addItem(applicationItem)
+        NSApp.mainMenu = mainMenu
+        model.applyLayout = { [weak self] in
+            if let recovery = self?.recoveryInteraction, try await recovery.observe() == .open {
+                throw PlatformError.unavailable("原应用界面仍然打开，请先关闭它再重新检测")
+            }
+            self?.failedSignature = ""
+            self?.awaitingManualRecovery = false
+            self?.recoveryInteraction = nil
+            try await self?.reconcile()
+        }
         let outside: (NSEvent) -> Void = { [weak self] event in
             Task { @MainActor in
                 guard let self, let drawer = self.drawer, drawer.isVisible else { return }
@@ -115,7 +134,12 @@ import FoldBarCore
         let width = min(CGFloat(max(1, hidden.count)) * 48 + 24, (window.screen?.visibleFrame.width ?? 600) - 32)
         panel.setContentSize(NSSize(width: max(200, width), height: 72))
         panel.contentView = NSHostingView(rootView: DrawerView(model: model) { [weak self] id, right in self?.activate(id, right: right) })
-        let anchor = window.convertToScreen(button.convert(button.bounds, to: nil))
+        let localAnchor = window.convertToScreen(button.convert(button.bounds, to: nil))
+        let anchor: CGRect
+        if let quartz = ownFrame(arrow) {
+            let height = NSScreen.screens.first?.frame.height ?? 0
+            anchor = CGRect(x: quartz.minX, y: height - quartz.maxY, width: quartz.width, height: quartz.height)
+        } else { anchor = localAnchor }
         let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? window.screen ?? NSScreen.main
         let bounds = screen?.frame ?? anchor.insetBy(dx: -300, dy: -300)
         panel.setFrameOrigin(NSPoint(x: min(max(anchor.midX - panel.frame.width / 2, bounds.minX + 8), bounds.maxX - panel.frame.width - 8), y: bounds.maxY - NSStatusBar.system.thickness - panel.frame.height - 8))
@@ -131,33 +155,42 @@ import FoldBarCore
 
     private func environmentChanged() {
         dismissDrawer()
+        boundary.length = 1
         // Drop stale screen images before discovering the new active display.
         model.images = [:]
         lastSignature = ""
-        Task { await refreshAndApply() }
+        failedSignature = ""
+        Task {
+            try? await Task.sleep(for: .milliseconds(200))
+            await refreshAndApply()
+        }
     }
 
     private func refreshAndApply() async {
         guard !interacting, !reconciling else { pending = true; return }
         await model.refresh()
-        guard model.accessibility, model.screenCapture, model.store != nil else { boundary.length = 1; return }
+        guard !awaitingManualRecovery else { boundary.length = 1; return }
+        guard model.accessibility, model.screenCapture, model.store != nil else { boundary.length = 1; lastSignature = ""; failedSignature = ""; return }
         let signature = model.live.map(\.id).joined(separator: "|") + model.records.map { $0.id + $0.group.rawValue }.joined(separator: "|")
-        guard signature != lastSignature else { return }
-        lastSignature = signature
-        do { try await reconcile() }
-        catch { model.message = error.localizedDescription }
+        guard signature != lastSignature, signature != failedSignature else { return }
+        do { try await reconcile(); lastSignature = signature }
+        catch { failedSignature = signature; model.message = error.localizedDescription + "。解决后点击“重新检测”重试。" }
     }
 
-    private func ownFrame(_ item: NSStatusItem) -> CGRect? {
+    private func ownElement(_ item: NSStatusItem) -> AXUIElement? {
         // macOS 27 hosts status items in MenuBarAgent. The local button's window
         // transform may describe the backing surface, not its presented position.
         let root = AXUIElementCreateApplication(getpid())
         if let bar = MenuBarPlatform.attribute(root, "AXExtrasMenuBar"), CFGetTypeID(bar) == AXUIElementGetTypeID() {
             let children = MenuBarPlatform.attribute(bar as! AXUIElement, "AXChildren") as? [AXUIElement] ?? []
             let label = item === arrow ? "FoldBar" : "FoldBar 布局边界"
-            if let element = children.first(where: { (MenuBarPlatform.attribute($0, "AXDescription") as? String) == label }),
-               let rect = MenuBarPlatform.rect(element) { return rect }
+            return children.first(where: { (MenuBarPlatform.attribute($0, "AXDescription") as? String) == label })
         }
+        return nil
+    }
+
+    private func ownFrame(_ item: NSStatusItem) -> CGRect? {
+        if let element = ownElement(item), let frame = MenuBarPlatform.rect(element) { return frame }
         guard let button = item.button, let window = button.window else { return nil }
         let rect = window.convertToScreen(button.convert(button.bounds, to: nil))
         let height = NSScreen.screens.first?.frame.height ?? 0
@@ -168,12 +201,28 @@ import FoldBarCore
         guard !reconciling else { pending = true; return }
         guard !interacting, model.accessibility, model.screenCapture, model.store != nil else { boundary.length = 1; return }
         reconciling = true
+        model.busy = true
         boundary.length = 1
         defer {
             reconciling = false
+            model.busy = false
             if pending { pending = false; Task { await refreshAndApply() } }
         }
         do {
+            // A length assignment does not synchronously present host-rendered items.
+            // Allow a bounded interval for fresh AX hit tests before injecting input.
+            for _ in 0..<6 {
+                let movable = model.live.filter { $0.reason == nil }
+                if movable.allSatisfy({ model.platform.isPresented($0.element) }) { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            let active = model.records.compactMap { record in model.live.first { $0.id == record.id && $0.reason == nil } }
+            let hiddenIDs = Set(model.records.filter { $0.group == .hidden }.map(\.id))
+            let currentVisibleOrder = active.sorted { (MenuBarPlatform.rect($0.element)?.minX ?? 0) < (MenuBarPlatform.rect($1.element)?.minX ?? 0) }.map(\.id)
+            // Initial discovery already records observed order. Do not inject
+            // desktop input just to normalize gaps or move our own arrow.
+            if hiddenIDs.isEmpty, currentVisibleOrder == active.map(\.id) { return }
+            let visibleBefore = active.filter { !hiddenIDs.contains($0.id) && model.platform.isPresented($0.element) }
             for group in [ItemGroup.visible, .hidden] {
                 var anchor = ownFrame(group == .visible ? arrow : boundary)
                 for record in model.records.filter({ $0.group == group }).reversed() {
@@ -187,10 +236,26 @@ import FoldBarCore
                     anchor = MenuBarPlatform.rect(item.element)
                 }
             }
+            let expected = [ItemGroup.hidden, .visible].flatMap { group in
+                model.records.filter { $0.group == group }.compactMap { record in
+                    model.live.first { $0.id == record.id && $0.reason == nil }
+                }
+            }
+            let actual = expected.sorted { (MenuBarPlatform.rect($0.element)?.minX ?? 0) < (MenuBarPlatform.rect($1.element)?.minX ?? 0) }
+            guard actual.map(\.id) == expected.map(\.id) else {
+                throw PlatformError.unavailable("系统图标顺序与配置不一致，已停止隐藏；此布局尚未成功应用")
+            }
             if model.records.contains(where: { record in record.group == .hidden && model.live.contains(where: { $0.id == record.id }) }) {
                 // NSStatusItem.length only allocates our own space. Whether the OS
                 // overflows items on its left is observed rather than API-guaranteed.
                 boundary.length = max(10_000, (NSScreen.screens.map { $0.frame.width }.max() ?? 0) * 2)
+                try await Task.sleep(for: .milliseconds(200))
+                guard let arrowElement = ownElement(arrow), model.platform.isPresented(arrowElement), let arrowFrame = ownFrame(arrow),
+                      NSScreen.screens.contains(where: { MenuBarPlatform.quartzFrame($0).contains(arrowFrame) }),
+                      visibleBefore.allSatisfy({ model.platform.isPresented($0.element) }),
+                      active.filter({ hiddenIDs.contains($0.id) }).allSatisfy({ !model.platform.isPresented($0.element) }) else {
+                    throw PlatformError.unavailable("macOS 没有可靠完成指定图标的隐藏，已释放隐藏边界；配置已保留，但此布局尚未应用")
+                }
             }
         } catch {
             boundary.length = 1
@@ -202,25 +267,26 @@ import FoldBarCore
         guard !interacting, !reconciling, let item = model.live.first(where: { $0.id == id }) else { return }
         dismissDrawer()
         interacting = true
+        model.busy = true
         layoutTask = Task {
-            do {
-                try await restoringLayout(operation: {
+            let interaction = MenuInteraction(platform: self.model.platform, item: item, right: right,
+                exposure: {
                     self.boundary.length = 1
                     try await Task.sleep(for: .milliseconds(180))
-                    try self.model.platform.press(item, right: right)
-                    // Wait for the original menu or panel to finish before restoring.
-                    for _ in 0..<600 {
-                        try await Task.sleep(for: .milliseconds(200))
-                        let root = AXUIElementCreateApplication({ var pid: pid_t = 0; AXUIElementGetPid(item.element, &pid); return pid }())
-                        let menu = MenuBarPlatform.attribute(root, "AXFocusedUIElement")
-                        if menu == nil && NSEvent.pressedMouseButtons == 0 { break }
-                    }
-                }, restore: {
+                }, restoration: { canMove in
                     self.interacting = false
-                    try await self.reconcile()
+                    if canMove { try await self.reconcile() }
+                    else { self.boundary.length = 1; self.awaitingManualRecovery = true }
                 })
-            } catch { self.boundary.length = 1; self.model.message = error.localizedDescription }
+            do {
+                try await runNativeInteraction(interaction)
+            } catch {
+                self.recoveryInteraction = interaction
+                self.boundary.length = 1
+                self.model.message = error.localizedDescription
+            }
             self.interacting = false
+            self.model.busy = false
         }
     }
 
@@ -242,7 +308,9 @@ import FoldBarCore
 
 @available(macOS 27.0, *)
 extension AppDelegate: @preconcurrency NSStatusItemExpandedInterfaceDelegate {
-    func statusItem(_ statusItem: NSStatusItem, didBegin expandedInterfaceSession: NSStatusItemExpandedInterfaceSession) { showDrawer() }
+    func statusItem(_ statusItem: NSStatusItem, didBegin expandedInterfaceSession: NSStatusItemExpandedInterfaceSession) {
+        if NSApp.currentEvent?.type == .rightMouseUp { statusClick() } else { showDrawer() }
+    }
     func statusItemDidEndExpandedInterfaceSession(_ statusItem: NSStatusItem, animated: Bool) {
         drawer?.orderOut(nil)
         drawer = nil
@@ -270,7 +338,12 @@ private struct IconButton: NSViewRepresentable {
     let image: NSImage?
     let title: String
     let action: (Bool) -> Void
-    func makeNSView(context: Context) -> NativeIconButton { NativeIconButton() }
+    func makeNSView(context: Context) -> NativeIconButton {
+        let button = NativeIconButton()
+        button.target = button
+        button.action = #selector(NativeIconButton.activate)
+        return button
+    }
     func updateNSView(_ button: NativeIconButton, context: Context) {
         button.image = image ?? NSImage(systemSymbolName: "app", accessibilityDescription: title)
         button.imagePosition = .imageOnly
@@ -285,6 +358,7 @@ private struct IconButton: NSViewRepresentable {
 
 private final class NativeIconButton: NSButton {
     var callback: ((Bool) -> Void)?
+    @objc func activate() { callback?(false) }
     override func mouseUp(with event: NSEvent) { callback?(false) }
     override func rightMouseUp(with event: NSEvent) { callback?(true) }
     override func mouseDown(with event: NSEvent) {}

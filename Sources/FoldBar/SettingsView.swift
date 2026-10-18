@@ -54,7 +54,7 @@ struct SettingsView: View {
             HStack {
                 Text("所有桌面和显示器共用此布局").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("重新检测") { Task { await model.refresh() } }.disabled(model.busy)
+                Button("重新检测", action: model.retryLayout).disabled(model.busy)
             }
         }
     }
@@ -94,7 +94,7 @@ struct SettingsView: View {
             else if live?.reason != nil { Image(systemName: "lock.fill").font(.system(size: 9)).foregroundStyle(.secondary) }
         }
         .frame(width: 82, height: 76).opacity(live == nil ? 0.45 : 1)
-        .help(live?.reason ?? record.name)
+        .help(live?.reason ?? model.captureIssues[record.id] ?? record.name)
         .accessibilityLabel(record.name + (live == nil ? "，未运行" : ""))
     }
 

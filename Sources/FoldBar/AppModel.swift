@@ -9,6 +9,7 @@ import FoldBarCore
     @Published var records: [ItemIdentity] = []
     @Published var live: [LiveItem] = []
     @Published var images: [String: NSImage] = [:]
+    @Published var captureIssues: [String: String] = [:]
     @Published var message: String?
     @Published var accessibility = false
     @Published var screenCapture = false
@@ -43,24 +44,55 @@ import FoldBarCore
         refreshing = true
         defer { refreshing = false }
         updatePermissions()
-        guard accessibility else { live = []; return }
+        guard accessibility else { live = []; images = [:]; captureIssues = [:]; return }
         let found = await Task.detached(priority: .utility) { MenuBarPlatform.scan() }.value
+        guard !busy else { return }
+        for item in found {
+            if live.first(where: { $0.id == item.id }).map({ !CFEqual($0.element, item.element) }) ?? true {
+                images.removeValue(forKey: item.id)
+            }
+        }
         live = found
         do {
             let eligible = found.filter { !$0.id.hasPrefix("ambiguous:") }
             try store?.discover(eligible.map { ItemIdentity(id: $0.id, name: $0.name) })
             records = store?.items ?? []
         } catch { message = "无法保存新图标，原配置已保留：\(error.localizedDescription)" }
-        let valid = Set(found.map(\.id)).union(records.filter { $0.group == .hidden }.map(\.id))
+        let valid = Set(found.map(\.id))
         images = images.filter { valid.contains($0.key) }
-        guard screenCapture else { return }
+        captureIssues = captureIssues.filter { valid.contains($0.key) }
+        guard screenCapture else { images = [:]; return }
         for item in found {
             if busy || Task.isCancelled { break }
+            // A successfully hidden icon keeps its last capture only while the same
+            // AX endpoint remains alive. Environment changes clear the whole cache.
+            if records.contains(where: { $0.id == item.id && $0.group == .hidden }), images[item.id] != nil { continue }
             let collisions = found.filter { $0.id != item.id && $0.frame.intersection(item.frame).width > min($0.frame.width, item.frame.width) * 0.8 }
             // Native overflow can give many items identical placeholder geometry.
             // Such geometry is not evidence of which pixels belong to this item.
-            guard collisions.isEmpty else { continue }
-            if let image = try? await platform.capture(item) { images[item.id] = image }
+            guard collisions.isEmpty else {
+                images.removeValue(forKey: item.id)
+                captureIssues[item.id] = "系统溢出区未提供独立图标位置，请先在菜单栏展开此图标"
+                continue
+            }
+            do {
+                images[item.id] = try await platform.capture(item)
+                captureIssues.removeValue(forKey: item.id)
+            } catch {
+                images.removeValue(forKey: item.id)
+                captureIssues[item.id] = error.localizedDescription
+            }
+        }
+    }
+
+    func retryLayout() {
+        guard !busy else { return }
+        Task {
+            await refresh()
+            busy = true
+            defer { busy = false }
+            do { try await applyLayout?(); message = nil }
+            catch { message = error.localizedDescription }
         }
     }
 

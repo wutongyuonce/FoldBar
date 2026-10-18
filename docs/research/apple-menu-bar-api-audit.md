@@ -37,3 +37,15 @@ SDK 根：`/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk`，`SDKSettings.j
 - 同目录 `AXUIElement.h:188–223,283–331,387–402`：属性可写性、支持操作、操作结果和超时语义。
 
 SDK 检查与文档核查已完成；隐藏、重排、隐藏项截图、真实菜单、Spaces、全屏、自动隐藏菜单栏和显示器热插拔均仍须逐项实测。
+
+## 补充：macOS 27 的系统原生溢出行为
+
+Apple 于 2026-09-28 发布的 [What's new for enterprise in macOS Golden Gate 27](https://support.apple.com/en-us/148830) 明确说明：菜单栏容不下全部项目时，系统自动隐藏一部分，并用紧凑的溢出指示器代替；按下该指示器可显示隐藏项目。因此 macOS 27 的项目消失可能是系统管理的溢出，不等于传统“用超长状态项把项目推到屏幕外”。
+
+本次补充检查 `NSStatusBar.h`、`NSStatusItem.h`、`NSStatusItemExpandedInterfaceSession.h` 及 AX 常量，仍未发现公开的跨 app 溢出项目选择、显隐分组、排序或系统溢出会话 API。27 的 expanded interface 仍是本 app 自己状态项的展开窗口合同。系统设置的“Allow in the Menu Bar”可控制部分 app 项目，但 Apple 用户手册没有将其声明为第三方控制接口。[Apple macOS 27 菜单栏设置](https://support.apple.com/en-euro/guide/mac-help/mchlad96d366/27/mac/27)
+
+观察到 MenuBarAgent AX 对话框和“隐藏菜单栏项目”按钮时，**可检验的推断**是：它是原生溢出展示模式的收起按钮；不能仅凭标签确定，更不能当作任意图标隐藏命令。相同占位坐标应视为当前不可定位，而非多个图标的真实可点击位置。
+
+下一步最小实验（尚未执行）：在不改变任何排序、不做拖动、不给边界项设超长长度的条件下，记录该按钮的 AX 身份、支持动作、对话框子项及目标图标 frame/hit-test；对其实际支持的 Press 动作只执行一次，再读取状态。若对话框消失、按钮变成“显示…”/展开指示器，且原本可见子项变成同坐标占位，支持“收起系统溢出”假设；若无此变化则否定或继续调查。随后通过刚观察到的真实展开按钮恢复一次，比较图标是否获得独立可 hit-test frame。不得对旧占位坐标发送点击或 Command-drag。
+
+在原生展开与收起能可逆确认之后，再单独测试一个临时自有状态项从正常宽度增大到屏幕宽度以上、再恢复，比较溢出项目集合及指示器。该实验可直接证伪“超长边界仍按传统方式工作”，且不需先改用户图标顺序。每次只改变一个因素，成功标准是 AX 状态和实际命中结果，而不是事件函数返回成功。
